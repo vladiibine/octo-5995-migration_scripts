@@ -1,11 +1,14 @@
 __author__ = 'vardelean'
+
+import urllib2
 import MySQLdb
 import os
 import oauth2 as oauth
 import httplib2
+import time
+import json
 
 # import httplib
-# import time
 # import sys
 # from optparse import OptionParser
 
@@ -13,11 +16,16 @@ import httplib2
 assert 'DJANGO_SETTINGS_MODULE' in os.environ, ("the DJANGO_SETTINGS_MODULE "
                                                 "needs to be specified")
 
+METHOD_POST = 'POST'
 DJANGO_SETTINGS_MODULE = os.environ['DJANGO_SETTINGS_MODULE']
 
 package_name = DJANGO_SETTINGS_MODULE.rsplit('.', 1)[0]
 settings_module = __import__(DJANGO_SETTINGS_MODULE, fromlist=[package_name])
+
 S3_STORAGE_ENDPOINT = settings_module.S3_STORAGE_ENDPOINT
+ITS_ENDPOINT = settings_module.ITS_ENDPOINT
+ITS_CONSUMER_KEY = settings_module.ITS_CONSUMER_KEY
+ITS_CONSUMER_SECRET = settings_module.ITS_CONSUMER_SECRET
 
 if not S3_STORAGE_ENDPOINT.endswith('/'):
     S3_STORAGE_ENDPOINT += '/'
@@ -26,7 +34,9 @@ if not S3_STORAGE_ENDPOINT.endswith('/'):
 def mkcon():
     """Mock this better.... wtf!!!
     """
-    return MySQLdb.connect('localhost', 'merlin_user', '')
+    connection = MySQLdb.connect('localhost', 'merlin_user', '')
+    connection.autocommit(False)
+    return connection
 
 
 #1.Migrate WebObject images, with webobject_type='Video'
@@ -63,14 +73,13 @@ def update_wo_image(cursor, updatable_wos):
                        """, (wo_id,))
 
 
-def migrate_videoasset_its_imgs():
+def copy_videoasset_its_imgs(con, cursor):
     """For all the WebObjects of type Video with ITS images, migrates those
         images
 
-    Ignore duplicates (same image multiple times = ok
+    SHOULD be ready for testing
 
     """
-    con = mkcon()
     con.query("""
             SELECT wo.id, vaif.ingested_url, vaif.profile_id
                 FROM merlin.core_webobject AS wo
@@ -88,14 +97,11 @@ def migrate_videoasset_its_imgs():
 
     res = con.store_result()
     wo_imgs_map = get_webobj_imgs_map(res)
-    cursor = con.cursor()
-    updatable_wos = create_updatable_wos_map(wo_imgs_map)
+    updatable_wos = create_usable_imgs_map(wo_imgs_map)
     update_wo_image(cursor, updatable_wos)
-    con.commit()
-    con.close()
 
 
-def create_updatable_wos_map(wo_imgs_map):
+def create_usable_imgs_map(wo_imgs_map):
     """Returns a map of WO Ids : New Image (url) to be used in the migration
     """
     updatable_wos = {}
@@ -113,7 +119,7 @@ def create_updatable_wos_map(wo_imgs_map):
     return updatable_wos
 
 
-def build_request(url, consumer, method='GET'):
+def build_request(url, consumer, method='POST'):
     params = {
         'oauth_version': "1.0",
         'oauth_nonce': oauth.generate_nonce(),
@@ -126,33 +132,63 @@ def build_request(url, consumer, method='GET'):
     return req
 
 
-def get_its_link(url):
+def upload_img_to_its(img_url, its_endpoint, its_cons_key, its_cons_secret):
     """Uploads the specified image, from the given url into ITS, and returns
     the link for that image
 
+    :return The URL of the image, posted in ITS
     """
-    #Hardcode authentication
-    oauth_consumer = oauth.Consumer(
-        key='MERLIN-EF5855AD-34B7-48EF-BA1A-4974A9810C1C',
-        secret='6EF0D4A9-1AF1-4A7E-BD6E-6F109FDB4877')
+    oauth_consumer = oauth.Consumer(key=its_cons_key,
+                                    secret=its_cons_secret)
+
+    try:
+        image_stream = urllib2.urlopen(img_url)
+    except urllib2.HTTPError, e:
+        raise UploadException(e)
+
+    request = build_request(its_endpoint, oauth_consumer, METHOD_POST)
 
     conn = httplib2.Http()
+    headers = {'Content-Type': 'image/png'}
+    resp, content = conn.request(
+        request.to_url(),
+        METHOD_POST,
+        body=image_stream.read(),
+        headers=headers)
 
-    request = build_request('')
+    if resp['status'] == 201:
+        json_content = json.loads(content)
+        return json_content['public_url']
+    else:
+        raise UploadException('Uploading failed for %s' % img_url)
 
-    pass
+
+def migrate_from_result(cursor, res):
+    """Given the result set, and the cursor, updates the
+    """
+    errors = {}
+    wo_imgs_map = get_webobj_imgs_map(res)
+    updatable_wos = create_usable_imgs_map(wo_imgs_map)
+    updated_wos = {}
+    for wo_id, img_url in updatable_wos:
+        try:
+            updated_wos[wo_id] = upload_img_to_its(img_url, ITS_ENDPOINT,
+                                                   ITS_CONSUMER_KEY,
+                                                   ITS_CONSUMER_SECRET)
+        except UploadException:
+            errors[wo_id] = img_url
+    if not errors:
+        update_wo_image(cursor, updated_wos)
+    else:
+        raise Exception('')
 
 
-def migrate_video_non_its_images():
+def migrate_video_non_its_images(con, cursor):
     """
     This will get both valid URLs and relative links (though most likely not).
     Append to the relative links the S3_STORAGE_ENDPOINT.
 
-    S3_STORAGE_ENDPOINT
-
-    For relative links, migrate them all
     """
-    con = mkcon()
     con.query("""
             SELECT wo.id, vaif.ingested_url, vaif.profile_id
             FROM merlin.core_webobject AS wo
@@ -169,66 +205,68 @@ def migrate_video_non_its_images():
     """)
     res = con.store_result()
 
-    wo_imgs_map = get_webobj_imgs_map(res)
-
-    updatable_wos = create_updatable_wos_map(wo_imgs_map)
-    #TODO: here's where we must process every image im the wo_imgs_map
-    #...meaning upload to ITS and get the ITS link
-    updated_wos = {}
-    for wo_id, img_url in updatable_wos:
-        updated_wos[wo_id] = get_its_link(img_url)
-
-    update_wo_image(con.cursor(), updated_wos)
-    con.commit()
-    con.close()
+    migrate_from_result(cursor, res)
 
 
 def migrate_non_vid_its_images():
     pass
 
 
-#TODO: the urls of form "webobjects/asdfasdfasdf.asdf" remain the same
-
-
-#TODO: the images from weird sites are to be ingested into ITS, and we keep the
-# url
-
-def ingest_valid_imgs_into_ITS():
+def migrate_non_vid_non_its(con, cursor):
     """All the images that don't belong to the ITS endpoints will be uploaded
     to the ITS_ENDPOINT specified in the DJANGO_SETTINGS_MODULE
-    """
 
-    #need a consumer key (settings_module.ITS_CONSUMER_KEY)
-    #need a consumer secret (settings_module.ITS_CONSUMER_SECRET_KEY)
-    #need an its endpoint (settings_module.ITS_ENDPOINT)
-    conn = mkcon()
-    conn.query("""
-    SELECT wo.id, vaif.ingested_url, vaif.profile_id
+    Does migration for WebObjects of type WebObject (non-Video)
+    """
+    #we fake the profile ID - We hardcode mezzanine - doesn't matter either way
+    con.query("""
+    SELECT wo.id, wo.image, 10
         FROM merlin.core_webobject AS wo
-        INNER JOIN merlin.core_video AS video
-            ON wo.id = video.webobject_ptr_id
-        INNER JOIN merlin.videoingester_videoasset AS vasset
-            ON video.videoasset_guid = vasset.guid
-        INNER JOIN merlin.videoingester_videoassetimagefile AS vaif
-            ON vasset.id = vaif.video_asset_id
-        WHERE webobject_type='Video'
-        AND NOT ( vaif.ingested_url LIKE 'http://image.pbs.org%'
-            OR vaif.ingested_url LIKE 'http://image-staging.pbs.org%'
-        );
+        WHERE wo.webobject_type = 'WebObject'
+        AND NOT (
+                wo.image LIKE 'http://image.pbs.org%'
+                OR wo.image LIKE 'http://image-staging.pbs.org%'
+            )
+        AND wo.image <> ''
+    ;
     """)
+
+    res = con.store_result()
+    migrate_from_result(cursor, res)
+
+
+def copy_non_vid_its(con, cursor):
+    """
+    For the WeObjects (webobject_type = 'WebObject') with ITS images,
+        either  
+    """
+    pass
+
+
+class UploadException(Exception):
     pass
 
 
 
 
 
-    #Migrate images
+if __name__ == '__main__':
 
+    con = mkcon()  #!!!! do this better, rofl!
+    cursor = con.cursor()
 
-    # res1 =SELECT id from merlin.core_webobject where webobject_type = 'Video'
-    # for id in res1:
-    #
-    #
-    #
+    try:
+        copy_videoasset_its_imgs(con, cursor)
 
-    #2.Migrate
+        migrate_video_non_its_images(con, cursor)
+
+        migrate_non_vid_non_its(con, cursor)
+
+        copy_non_vid_its(con, cursor)
+
+    except Exception, e:
+        con.rollback()
+    else:
+        con.commit()
+
+    con.close()
