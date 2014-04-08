@@ -68,7 +68,7 @@ def update_wo_image(cursor, updatable_wos):
         else:
             cursor.execute("""
                      UPDATE merlin.core_webobject
-                     SET image = NULL
+                     SET image = ''
                      WHERE id = %s;
                        """, (wo_id,))
 
@@ -235,24 +235,35 @@ def migrate_non_vid_non_its(con, cursor):
     migrate_from_result(cursor, res)
 
 
+def migrate_video_page_imgs(con, cursor):
+    """For the videopages, copy the ITS image url from the related VideoAsset
+
+        For those assets without an ITS url, ingest into ITS that url, and
+        update the VideoPage to use the new ITS url.
+    """
+    con.query("""
+    """)
+    pass
+
+
 def copy_non_vid_its(con, cursor):
     """
     For the WeObjects (webobject_type = 'WebObject') with ITS images,
-        either  
+        don't do anything
     """
+
     pass
 
 
 class UploadException(Exception):
+
     pass
 
 
-
-
-
 if __name__ == '__main__':
+    # TODO: log the objects which failed to update, don't rollback
 
-    con = mkcon()  #!!!! do this better, rofl!
+    con = mkcon()  # TODO!!!! do this better, rofl!
     cursor = con.cursor()
 
     try:
@@ -263,6 +274,8 @@ if __name__ == '__main__':
         migrate_non_vid_non_its(con, cursor)
 
         copy_non_vid_its(con, cursor)
+
+        migrate_video_page_imgs(con, cursor)
 
     except Exception, e:
         con.rollback()
