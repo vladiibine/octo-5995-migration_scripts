@@ -7,6 +7,10 @@ import oauth2 as oauth
 import httplib2
 import time
 import json
+import logging
+
+logger = logging.getLogger(__name__)
+logging.basicConfig()
 
 # import httplib
 # import sys
@@ -37,11 +41,6 @@ def mkcon():
     connection = MySQLdb.connect('localhost', 'merlin_user', '')
     connection.autocommit(False)
     return connection
-
-
-#1.Migrate WebObject images, with webobject_type='Video'
-#-copy image from VideoAssetImageFile.ingested_url (with) to WebOjbect
-# .image <--- For ITSurls
 
 
 def get_obj_imgs_map(res):
@@ -85,20 +84,20 @@ def update_vpage_image(cursor, updatable_vps):
             #TODO: get rid of 'merlin' - hardcoded database name
             cursor.execute("""
              UPDATE merlin.videoportal_videopage
-             SET image = %s
+             SET stack_image = %s
              WHERE id = %s
             """, (image, vp_id))
         else:
             #TODO: get rid of 'merlin' - hardcoded database name
             cursor.execute("""
              UPDATE merlin.videoportal_videopage
-             SET image = ''
+             SET stack_image = ''
              WHERE id = %s
             """, (vp_id,))
     pass
 
 
-def copy_videoasset_its_imgs(con, cursor):
+def copy_wo_its_imgs(con, cursor):
     """For all the WebObjects of type Video with ITS images, migrates those
         images
 
@@ -161,6 +160,10 @@ def upload_img_to_its(img_url, its_endpoint, its_cons_key, its_cons_secret):
     """Uploads the specified image, from the given url into ITS, and returns
     the link for that image
 
+    :param its_cons_secret: its consumer secret key (from the settings module)
+    :param its_cons_key: the consumer key (from the settings module)
+    :param its_endpoint: the ITS endpoint (from the settings file)
+    :param img_url: the source url of the image
     :return The URL of the image, posted in ITS
     """
     oauth_consumer = oauth.Consumer(key=its_cons_key,
@@ -168,7 +171,7 @@ def upload_img_to_its(img_url, its_endpoint, its_cons_key, its_cons_secret):
 
     try:
         image_stream = urllib2.urlopen(img_url)
-    except urllib2.HTTPError, e:
+    except (urllib2.HTTPError, AttributeError), e:
         raise UploadException(e)
 
     request = build_request(its_endpoint, oauth_consumer, METHOD_POST)
@@ -189,19 +192,23 @@ def upload_img_to_its(img_url, its_endpoint, its_cons_key, its_cons_secret):
 
 
 def migrate_from_result(cursor, res, update_func):
-    """Given the result set, and the cursor, updates the
+    """Given the result set, the cursor and the specific update function,
+        updates the given object with the specific img_url
     """
     errors = {}
     model_imgs_map = get_obj_imgs_map(res)
     updatable_objs = create_usable_imgs_map(model_imgs_map)
     updated_objs = {}
-    for wo_id, img_url in updatable_objs:
+    for obj_id, img_url in updatable_objs:
         try:
-            updated_objs[wo_id] = upload_img_to_its(img_url, ITS_ENDPOINT,
-                                                    ITS_CONSUMER_KEY,
-                                                    ITS_CONSUMER_SECRET)
+            if img_url:
+                updated_objs[obj_id] = upload_img_to_its(img_url, ITS_ENDPOINT,
+                                                        ITS_CONSUMER_KEY,
+                                                        ITS_CONSUMER_SECRET)
+            else:
+                updated_objs[obj_id] = ''
         except UploadException:
-            errors[wo_id] = img_url  # TODO: distinguish between WO and VP ids?
+            errors[obj_id] = img_url
 
     if not errors:
         update_func(cursor, updated_objs)
@@ -234,8 +241,8 @@ def migrate_video_non_its_images(con, cursor):
     try:
         migrate_from_result(cursor, res, update_wo_image)
     except UploadException, ex:
-        #TODO - Log WO failures (ex.errors)
-        pass
+        logger.warning("The following WebObjects had errors:")
+        logger.warning(ex.errors)
 
 
 def migrate_non_vid_its_images():
@@ -265,11 +272,11 @@ def migrate_non_vid_non_its(con, cursor):
     try:
         migrate_from_result(cursor, res, update_wo_image)
     except UploadException, ex:
-        #TODO - log the WO failures (ex.errors)
-        pass
+        logger.warning("The following WebObjects had errors:")
+        logger.warning(ex.errors)
 
 
-def migrate_video_page_imgs(con, cursor):
+def migrate_vpage_non_its_imgs(con, cursor):
     """For the videopages, copy the ITS image url from the related VideoAsset
 
         For those assets without an ITS url, ingest into ITS that url, and
@@ -283,7 +290,12 @@ def migrate_video_page_imgs(con, cursor):
             ON page.video_asset_id = asset.id
 
         INNER JOIN merlin.videoingester_videoassetimagefile AS vaif
-            ON asset.id = vaif.video_asset_id;
+            ON asset.id = vaif.video_asset_id
+
+        WHERE NOT ( vaif.ingested_url LIKE 'http://image.pbs.org%'
+                    OR LIKE 'http://image-staging.pbs.org%' )
+        AND 'vaif.ingested_url' <> ''
+        ;
     """)
 
     res = con.store_result()
@@ -291,7 +303,8 @@ def migrate_video_page_imgs(con, cursor):
     try:
         migrate_from_result(cursor, res, update_vpage_image)
     except UploadException, ex:
-        #TODO - log the VP failures (ex.errors)
+        logger.warning("The following VideoPages had errors:")
+        logger.warning(ex.errors)
         pass
 
 
@@ -314,14 +327,61 @@ class UploadException(Exception):
             self.errors = {}
 
 
-if __name__ == '__main__':
-    # TODO: log the objects which failed to update, don't rollback
+def erase_unavailable_vp_imgs(con, cursor):
+    """Set as '' the `stack_image` property of VideoPages whose VideoAsset
+        doesn't have an image attached
+    """
+    # We fake the image and profile id (doesn't matter either way)
+    con.query("""
+    select outerpage.id, '', 10
+    from merlin.videoportal_videopage as outerpage
+    where outerpage.id not in
+        (select ((page.id))
+            from merlin.videoportal_videopage as page
 
+            inner join merlin.videoingester_videoasset as asset
+                on page.video_asset_id = asset.id
+
+            inner join merlin.videoingester_videoassetimagefile as vaif
+                on asset.id = vaif.video_asset_id
+        );
+    """)
+
+    res = con.store_result()
+    vpage_imgs_map = get_obj_imgs_map(res)
+    updatable_vpages = create_usable_imgs_map(vpage_imgs_map)
+    update_vpage_image(cursor, updatable_vpages)
+
+
+def migrate_vpage_its_imgs(con, cursor):
+    con.query("""
+        SELECT page.id, vaif.ingested_url, vaif.profile_id
+        FROM merlin.videoportal_videopage AS page
+
+        INNER JOIN merlin.videoingester_videoasset AS asset
+            ON page.video_asset_id = asset.id
+
+        INNER JOIN merlin.videoingester_videoassetimagefile AS vaif
+            ON asset.id = vaif.video_asset_id
+
+        WHERE ( vaif.ingested_url LIKE 'http://image.pbs.org%'
+                    OR LIKE 'http://image-staging.pbs.org%' )
+        AND 'vaif.ingested_url' <> ''
+        ;
+    """)
+    res = con.store_result()
+
+    vpage_imgs_map = get_obj_imgs_map(res)
+    updatable_vpages = create_usable_imgs_map(vpage_imgs_map)
+    update_vpage_image(cursor, updatable_vpages)
+
+
+if __name__ == '__main__':
     con = mkcon()  # TODO!!!! do this better, rofl!
     cursor = con.cursor()
 
     try:
-        copy_videoasset_its_imgs(con, cursor)
+        copy_wo_its_imgs(con, cursor)
 
         migrate_video_non_its_images(con, cursor)
 
@@ -329,11 +389,19 @@ if __name__ == '__main__':
 
         copy_non_vid_its(con, cursor)
 
-        migrate_video_page_imgs(con, cursor)
+        migrate_vpage_non_its_imgs(con, cursor)
+
+        migrate_vpage_its_imgs(con, cursor)
+
+        erase_unavailable_vp_imgs(con, cursor)
 
     except Exception, e:
-        con.rollback()
+        # TODO - log error
+        # con.rollback()
+        pass
     else:
-        con.commit()
+        # con.commit()
+        pass
 
+    con.commit()
     con.close()
