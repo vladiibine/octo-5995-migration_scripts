@@ -44,7 +44,7 @@ def mkcon():
 # .image <--- For ITSurls
 
 
-def get_webobj_imgs_map(res):
+def get_obj_imgs_map(res):
     """Returns the complete mapping of WOs to video profiles and image URLs
     """
     wo_imgs_map = {}
@@ -58,19 +58,44 @@ def get_webobj_imgs_map(res):
 
 
 def update_wo_image(cursor, updatable_wos):
+    """Updates WebObjects
+    """
     for wo_id, image in updatable_wos:
         if image:
+            #TODO: get rid of 'merlin' - hardcoded database name
             cursor.execute("""
                     UPDATE merlin.core_webobject
                     SET image = %s
                     WHERE id = %s;
                       """, (image, wo_id))
         else:
+            #TODO: get rid of 'merlin' - hardcoded database name
             cursor.execute("""
                      UPDATE merlin.core_webobject
                      SET image = ''
                      WHERE id = %s;
                        """, (wo_id,))
+
+
+def update_vpage_image(cursor, updatable_vps):
+    """Updates VideoPages
+    """
+    for vp_id, image in updatable_vps:
+        if image:
+            #TODO: get rid of 'merlin' - hardcoded database name
+            cursor.execute("""
+             UPDATE merlin.videoportal_videopage
+             SET image = %s
+             WHERE id = %s
+            """, (image, vp_id))
+        else:
+            #TODO: get rid of 'merlin' - hardcoded database name
+            cursor.execute("""
+             UPDATE merlin.videoportal_videopage
+             SET image = ''
+             WHERE id = %s
+            """, (vp_id,))
+    pass
 
 
 def copy_videoasset_its_imgs(con, cursor):
@@ -96,7 +121,7 @@ def copy_videoasset_its_imgs(con, cursor):
     """)
 
     res = con.store_result()
-    wo_imgs_map = get_webobj_imgs_map(res)
+    wo_imgs_map = get_obj_imgs_map(res)
     updatable_wos = create_usable_imgs_map(wo_imgs_map)
     update_wo_image(cursor, updatable_wos)
 
@@ -163,24 +188,25 @@ def upload_img_to_its(img_url, its_endpoint, its_cons_key, its_cons_secret):
         raise UploadException('Uploading failed for %s' % img_url)
 
 
-def migrate_from_result(cursor, res):
+def migrate_from_result(cursor, res, update_func):
     """Given the result set, and the cursor, updates the
     """
     errors = {}
-    wo_imgs_map = get_webobj_imgs_map(res)
-    updatable_wos = create_usable_imgs_map(wo_imgs_map)
-    updated_wos = {}
-    for wo_id, img_url in updatable_wos:
+    model_imgs_map = get_obj_imgs_map(res)
+    updatable_objs = create_usable_imgs_map(model_imgs_map)
+    updated_objs = {}
+    for wo_id, img_url in updatable_objs:
         try:
-            updated_wos[wo_id] = upload_img_to_its(img_url, ITS_ENDPOINT,
-                                                   ITS_CONSUMER_KEY,
-                                                   ITS_CONSUMER_SECRET)
+            updated_objs[wo_id] = upload_img_to_its(img_url, ITS_ENDPOINT,
+                                                    ITS_CONSUMER_KEY,
+                                                    ITS_CONSUMER_SECRET)
         except UploadException:
-            errors[wo_id] = img_url
+            errors[wo_id] = img_url  # TODO: distinguish between WO and VP ids?
+
     if not errors:
-        update_wo_image(cursor, updated_wos)
+        update_func(cursor, updated_objs)
     else:
-        raise Exception('')
+        raise UploadException(errors=errors)
 
 
 def migrate_video_non_its_images(con, cursor):
@@ -205,7 +231,11 @@ def migrate_video_non_its_images(con, cursor):
     """)
     res = con.store_result()
 
-    migrate_from_result(cursor, res)
+    try:
+        migrate_from_result(cursor, res, update_wo_image)
+    except UploadException, ex:
+        #TODO - Log WO failures (ex.errors)
+        pass
 
 
 def migrate_non_vid_its_images():
@@ -232,7 +262,11 @@ def migrate_non_vid_non_its(con, cursor):
     """)
 
     res = con.store_result()
-    migrate_from_result(cursor, res)
+    try:
+        migrate_from_result(cursor, res, update_wo_image)
+    except UploadException, ex:
+        #TODO - log the WO failures (ex.errors)
+        pass
 
 
 def migrate_video_page_imgs(con, cursor):
@@ -242,8 +276,23 @@ def migrate_video_page_imgs(con, cursor):
         update the VideoPage to use the new ITS url.
     """
     con.query("""
+        SELECT page.id, vaif.ingested_url, vaif.profile_id
+        FROM merlin.videoportal_videopage AS page
+
+        INNER JOIN merlin.videoingester_videoasset AS asset
+            ON page.video_asset_id = asset.id
+
+        INNER JOIN merlin.videoingester_videoassetimagefile AS vaif
+            ON asset.id = vaif.video_asset_id;
     """)
-    pass
+
+    res = con.store_result()
+
+    try:
+        migrate_from_result(cursor, res, update_vpage_image)
+    except UploadException, ex:
+        #TODO - log the VP failures (ex.errors)
+        pass
 
 
 def copy_non_vid_its(con, cursor):
@@ -256,8 +305,13 @@ def copy_non_vid_its(con, cursor):
 
 
 class UploadException(Exception):
-
-    pass
+    def __init__(self, previous=None, *args, **kwargs):
+        super(UploadException, self).__init__(*args, **kwargs)
+        self.previous = previous
+        try:
+            self.errors = kwargs['errors']
+        except KeyError:
+            self.errors = {}
 
 
 if __name__ == '__main__':
