@@ -509,21 +509,21 @@ if __name__ == '__main__':
     cursor = con.cursor()
 
     try:
-#        copy_wo_its_imgs(con, cursor)
+        copy_wo_its_imgs(con, cursor)
 
-#        migrate_video_non_its_images(con, cursor)
+        migrate_video_non_its_images(con, cursor)
 
-#        migrate_non_vid_non_its(con, cursor)
+        migrate_non_vid_non_its(con, cursor)
 
         erase_wo_img_4_invalid_asset(con, cursor)
 
-#        copy_non_vid_its(con, cursor)
+        copy_non_vid_its(con, cursor)
 
-#        migrate_vpage_its_imgs(con, cursor)
+        migrate_vpage_its_imgs(con, cursor)
 
-#        migrate_vpage_non_its_imgs(con, cursor)
+        migrate_vpage_non_its_imgs(con, cursor)
 
-#        erase_unavailable_vp_imgs(con, cursor)
+        erase_unavailable_vp_imgs(con, cursor)
 
     except Exception, e:
         # con.rollback()
