@@ -1,8 +1,8 @@
 __author__ = 'vardelean'
-
+import sys
+import traceback
 import functools
 import requests
-from StringIO import StringIO
 
 import urllib2
 import MySQLdb
@@ -12,9 +12,15 @@ import httplib2
 import time
 import json
 import logging
+from StringIO import StringIO
+import imghdr
 
-logger = logging.getLogger(__name__)
-logging.basicConfig()
+logger = logging.Logger(__name__)
+handler = logging.StreamHandler()
+logger.addHandler(handler)
+formatter = logging.Formatter('%(levelname)s %(asctime)s %(message)s')
+handler.setFormatter(formatter)
+handler.setLevel(logging.DEBUG)
 logger.setLevel(logging.DEBUG)
 
 if __name__ == '__main__':
@@ -23,6 +29,9 @@ if __name__ == '__main__':
         "needs to be specified")
 
     METHOD_POST = 'POST'
+    VIDEO_ASSETS_NS = 'video-assets'
+    WEBOBJECTS_NS = 'webobjects'
+
     DJANGO_SETTINGS_MODULE = os.environ['DJANGO_SETTINGS_MODULE']
 
     package_name = DJANGO_SETTINGS_MODULE.rsplit('.', 1)[0]
@@ -33,6 +42,11 @@ if __name__ == '__main__':
     ITS_ENDPOINT = settings_module.ITS_ENDPOINT
     ITS_CONSUMER_KEY = settings_module.ITS_CONSUMER_KEY
     ITS_CONSUMER_SECRET = settings_module.ITS_CONSUMER_SECRET
+    DATABASE = settings_module.DATABASES['default']['NAME']
+    DB_USER = settings_module.DATABASES['default']['USER']
+    DB_USER_PW = settings_module.DATABASES['default'].get('PASSWORD', '')
+    DB_HOST = settings_module.DATABASES['default']['HOST']
+    DB_PORT = settings_module.DATABASES['default'].get('PORT', '')
 
     if not S3_STORAGE_ENDPOINT.endswith('/'):
         S3_STORAGE_ENDPOINT += '/'
@@ -48,9 +62,14 @@ def log_entry(func):
 
 
 def mkcon():
-    """Mock this better.... wtf!!!
+    """Creates a connection to the database
     """
-    connection = MySQLdb.connect('localhost', 'merlin_user', '')
+    conn_settings = {'host': DB_HOST, 'user': DB_USER, 'passwd': DB_USER_PW,
+                     'db': DATABASE}
+    if DB_PORT:
+        conn_settings['port'] = DB_PORT
+
+    connection = MySQLdb.connect(**conn_settings)
     connection.autocommit(False)
     return connection
 
@@ -68,47 +87,55 @@ def get_obj_imgs_map(res):
     return wo_imgs_map
 
 
-def update_wo_image(cursor, updatable_wos):
+def update_wo_image(con, cursor, updatable_wos):
     """Updates WebObjects
     """
     for wo_id, image in updatable_wos.items():
         # logger.debug(("WO id: %s" % wo_id) + ("image %s " % image))
-        if image:
-            #TODO: get rid of 'merlin' - hardcoded database name
-            affected = cursor.execute("""
-                    UPDATE merlin.core_webobject
-                    SET image = %s
-                    WHERE id = %s;
-                      """, (str(image), str(wo_id)))
-        else:
-            #TODO: get rid of 'merlin' - hardcoded database name
-            affected = cursor.execute("""
-                     UPDATE merlin.core_webobject
-                     SET image = ''
-                     WHERE id = %s;
-                       """, (str(wo_id),))
+        try:
+            if image:
+                affected = cursor.execute("""
+                        UPDATE %s.core_webobject
+                        SET image = %s
+                        WHERE id = %s;
+                          """, (DATABASE, str(image), str(wo_id)))
+            else:
+                affected = cursor.execute("""
+                         UPDATE %s.core_webobject
+                         SET image = ''
+                         WHERE id = %s;
+                           """, (DATABASE, str(wo_id),))
             logger.debug(
                 ('WO id: %s' % wo_id) + (' affected rows: %s' % affected))
+        except MySQLdb.MySQLError:
+            #TODO - log the failure
+            con.rollback()
+        else:
+            con.commit()
 
 
-def update_vpage_image(cursor, updatable_vps):
+def update_vpage_image(con, cursor, updatable_vps):
     """Updates VideoPages
     """
     for vp_id, image in updatable_vps.items():
-        if image:
-            #TODO: get rid of 'merlin' - hardcoded database name
-            cursor.execute("""
-             UPDATE merlin.videoportal_videopage
-             SET stack_image = %s
-             WHERE id = %s;
-            """, (str(image), str(vp_id)))
+        try:
+            if image:
+                cursor.execute("""
+                 UPDATE %s.videoportal_videopage
+                 SET stack_image = %s
+                 WHERE id = %s;
+                """, (DATABASE, str(image), str(vp_id)))
+            else:
+                cursor.execute("""
+                 UPDATE %s.videoportal_videopage
+                 SET stack_image = ''
+                 WHERE id = %s;
+                """, (DATABASE, str(vp_id),))
+        except:
+            #TODO - log failure
+            con.rollback()
         else:
-            #TODO: get rid of 'merlin' - hardcoded database name
-            cursor.execute("""
-             UPDATE merlin.videoportal_videopage
-             SET stack_image = ''
-             WHERE id = %s;
-            """, (str(vp_id),))
+            con.commit()
 
 
 @log_entry
@@ -121,25 +148,24 @@ def copy_wo_its_imgs(con, cursor):
     """
     con.query("""
             SELECT wo.id, vaif.ingested_url, vaif.profile_id
-                FROM merlin.core_webobject AS wo
-                INNER JOIN merlin.core_video AS video
+                FROM %s.core_webobject AS wo
+                INNER JOIN %s.core_video AS video
                     ON wo.id = video.webobject_ptr_id
-                INNER JOIN merlin.videoingester_videoasset AS vasset
+                INNER JOIN %s.videoingester_videoasset AS vasset
                     ON video.videoasset_guid = vasset.guid
-                INNER JOIN merlin.videoingester_videoassetimagefile AS vaif
+                INNER JOIN %s.videoingester_videoassetimagefile AS vaif
                     ON vasset.id = vaif.video_asset_id
                 WHERE webobject_type='Video'
                 AND ( vaif.ingested_url LIKE 'http://image.pbs.org%'
                     OR vaif.ingested_url LIKE 'http://image-staging.pbs.org%'
                 );
-    """)
+    """, (DATABASE, DATABASE, DATABASE, DATABASE,))
     res = con.store_result()
     wo_imgs_map = get_obj_imgs_map(res)
-    #logger.debug(str(wo_imgs_map))
     updatable_wos = create_usable_imgs_map(wo_imgs_map)
     #logger.debug(str(updatable_wos))
 
-    update_wo_image(cursor, updatable_wos)
+    update_wo_image(con, cursor, updatable_wos)
 
 
 def create_usable_imgs_map(obj_imgs_map):
@@ -204,30 +230,68 @@ def fetch_file(location, max_size=None):
     return buff.getvalue()
 
 
-def upload_img_to_its(img_url, its_endpoint, its_cons_key, its_cons_secret):
-    oauth_consumer = oauth.Consumer(key=its_cons_key,
-                                    secret=its_cons_secret)
-    request = build_request(its_endpoint, oauth_consumer, METHOD_POST)
-    headers = {'Content-Type': 'image/png'}  # TODO - dunno if this matters :|
-
+def upload_img_to_its(img_url, its_endpoint, namespace, its_cons_key,
+                      its_cons_secret):
     try:
-        image = fetch_file(img_url, 20)
-    except IOError:
-        raise UploadException(message='file too big')
+        oauth_consumer = oauth.Consumer(key=its_cons_key,
+                                        secret=its_cons_secret)
+        its_destination = (its_endpoint.rstrip('/') + '/' +
+                           namespace.rstrip('/') + '/')
 
-    request_url = request.to_url()
-
-    resp = requests.post(request_url, data=image, headers=headers)
-    if resp.status_code == 201:
+        request = build_request(its_destination, oauth_consumer, METHOD_POST)
+        headers = {}
         try:
-            ingested_url = json.loads(resp.text)['public_url']
-            logger.info("The obtained URL: %s" % ingested_url)
-            return ingested_url
-        except (TypeError, AttributeError):
-            raise UploadException(
-                message=('invalid response type: \n %s' % resp.text))
-        except KeyError:
-            raise UploadException(message='the public url was not returned')
+            image = fetch_file(img_url, 20)
+        except IOError, err:
+            # sys_last_traceback = getattr(sys, 'last_traceback', '')
+            # tb_str = str(sys_last_traceback.format_tb(sys_last_traceback))
+            msg = 'File too big. \nTaceback: %s' % get_last_traceback_str()
+            raise UploadException(message=msg, previous=err)
+
+        header_types = {'png': 'image/png', 'gif': 'image/gif',
+                        'jpeg': 'image/jpeg'}
+        file_obj = StringIO(image)
+        filetype = imghdr.what(file_obj)
+        logger.debug("The file type was %s" % filetype)
+        headers['Content-Type'] = header_types.get(filetype, 'image')
+
+        request_url = request.to_url()
+
+        resp = requests.post(request_url, data=image, headers=headers)
+        if resp.status_code == 201:
+            try:
+                ingested_url = json.loads(resp.text)['public_url']
+                logger.info("The obtained URL: %s" % ingested_url)
+                return ingested_url
+            except (TypeError, AttributeError), err:
+                # sys_last_traceback = getattr(sys, 'last_traceback', '')
+                # tb_str = str(sys_last_traceback.format_tb(
+                # sys_last_traceback))
+                message = ('Invalid response type: \n %s' % resp.text +
+                           '\nTraceback: %s ' % get_last_traceback_str()
+                )
+                raise UploadException(
+                    message=(message),
+                    previous=err)
+            except KeyError, err:
+                # sys_last_traceback = getattr(sys, 'last_traceback', '')
+                # tb_str = str(sys_last_traceback.format_tb(
+                # sys_last_traceback))
+                message = ('The public url was not returned' +
+                           '\nTraceback %s' % get_last_traceback_str())
+                raise UploadException(message=message
+                                      , previous=err)
+    except UploadException, err:
+        previous_err = getattr(err, 'previous', None)
+        prev_msg = getattr(previous_err, 'message', '')
+        raise UploadException(
+            message=(err.message + ' Previous msg:' + prev_msg))
+    except Exception, err:
+        # sys_last_traceback = getattr(sys, 'last_traceback', '')
+        # tb_str = str(sys_last_traceback.format_tb(sys_last_traceback))
+        message = ('Unhandled exception while uploading' +
+                   '\nTraceback: %s' % get_last_traceback_str())
+        raise UploadException(message=message, previous=err)
 
 
 def deprecated_upload_img_to_its(img_url, its_endpoint, its_cons_key,
@@ -282,7 +346,7 @@ def deprecated_upload_img_to_its(img_url, its_endpoint, its_cons_key,
         raise UploadException(message='Uploading failed for %s' % img_url)
 
 
-def migrate_from_result(cursor, res, update_func):
+def migrate_from_result(con, cursor, res, update_func, namespace):
     """Given the result set, the cursor and the specific update function,
         updates the given object with the specific img_url
     """
@@ -297,18 +361,21 @@ def migrate_from_result(cursor, res, update_func):
         logger.info("Processing %s out of " % counter + str(objs_count))
         try:
             if img_url:
-                logger.info("Object id: %s, img_url: %s" % (obj_id, img_url))
-                updated_objs[obj_id] = upload_img_to_its(
-                    img_url,
-                    ITS_ENDPOINT,
-                    ITS_CONSUMER_KEY,
-                    ITS_CONSUMER_SECRET)
+                logger.debug("Object id: %s, img_url: %s" % (obj_id, img_url))
+                its_url = upload_img_to_its(img_url, ITS_ENDPOINT,
+                                            namespace,
+                                            ITS_CONSUMER_KEY,
+                                            ITS_CONSUMER_SECRET)
+                logger.debug("The obtained ITS URL %s" % its_url)
+                updated_objs[obj_id] = its_url
             else:
                 updated_objs[obj_id] = ''
         except UploadException, e:
+            #TODO - log failure to upload image (Obj type: Obj id)
+            logger.info("")
             errors[obj_id] = {'img_url': img_url, 'error': e.message}
 
-    update_func(cursor, updated_objs)
+    update_func(con, cursor, updated_objs)
 
     if errors:
         logger.info("Errors: ")
@@ -325,22 +392,22 @@ def migrate_video_non_its_images(con, cursor):
     """
     con.query("""
             SELECT wo.id, vaif.ingested_url, vaif.profile_id
-            FROM merlin.core_webobject AS wo
-            INNER JOIN merlin.core_video AS video
+            FROM %s.core_webobject AS wo
+            INNER JOIN %s.core_video AS video
                 ON wo.id = video.webobject_ptr_id
-            INNER JOIN merlin.videoingester_videoasset AS vasset
+            INNER JOIN %s.videoingester_videoasset AS vasset
                 ON video.videoasset_guid = vasset.guid
-            INNER JOIN merlin.videoingester_videoassetimagefile AS vaif
+            INNER JOIN %s.videoingester_videoassetimagefile AS vaif
                 ON vasset.id = vaif.video_asset_id
             WHERE webobject_type='Video'
             AND NOT ( vaif.ingested_url LIKE 'http://image.pbs.org%'
                 OR vaif.ingested_url LIKE 'http://image-staging.pbs.org%'
             );
-    """)
+    """, (DATABASE, DATABASE, DATABASE, DATABASE,))
     res = con.store_result()
 
     try:
-        migrate_from_result(cursor, res, update_wo_image)
+        migrate_from_result(con, cursor, res, update_wo_image, VIDEO_ASSETS_NS)
     except UploadException, ex:
         logger.warning("The following WebObjects had errors:")
         logger.warning(ex.errors)
@@ -360,7 +427,7 @@ def migrate_non_vid_non_its(con, cursor):
     #we fake the profile ID - We hardcode mezzanine - doesn't matter either way
     con.query("""
     SELECT wo.id, wo.image, 10
-        FROM merlin.core_webobject AS wo
+        FROM %s.core_webobject AS wo
         WHERE wo.webobject_type = 'WebObject'
         AND NOT (
                 wo.image LIKE 'http://image.pbs.org%'
@@ -368,11 +435,11 @@ def migrate_non_vid_non_its(con, cursor):
             )
         AND wo.image <> ''
     ;
-    """)
+    """, (DATABASE,))
 
     res = con.store_result()
     try:
-        migrate_from_result(cursor, res, update_wo_image)
+        migrate_from_result(con, cursor, res, update_wo_image, WEBOBJECTS_NS)
     except UploadException, ex:
         logger.warning("The following WebObjects had errors:")
         logger.warning(ex.errors)
@@ -387,23 +454,24 @@ def migrate_vpage_non_its_imgs(con, cursor):
     """
     con.query("""
         SELECT page.id, vaif.ingested_url, vaif.profile_id
-        FROM merlin.videoportal_videopage AS page
+        FROM %s.videoportal_videopage AS page
 
-        INNER JOIN merlin.videoingester_videoasset AS asset
+        INNER JOIN %s.videoingester_videoasset AS asset
             ON page.video_asset_id = asset.id
 
-        INNER JOIN merlin.videoingester_videoassetimagefile AS vaif
+        INNER JOIN %s.videoingester_videoassetimagefile AS vaif
             ON asset.id = vaif.video_asset_id
 
         WHERE NOT ( vaif.ingested_url LIKE 'http://image.pbs.org%'
                     OR vaif.ingested_url LIKE 'http://image-staging.pbs.org%' )
         ;
-    """)
+    """, (DATABASE, DATABASE, DATABASE))
 
     res = con.store_result()
 
     try:
-        migrate_from_result(cursor, res, update_vpage_image)
+        migrate_from_result(con, cursor, res, update_vpage_image,
+                            VIDEO_ASSETS_NS)
     except UploadException, ex:
         logger.warning("The following VideoPages had errors:")
         logger.warning(ex.errors)
@@ -435,46 +503,54 @@ def erase_unavailable_vp_imgs(con, cursor):
     # We fake the image and profile id (doesn't matter either way)
     con.query("""
     select outerpage.id, '', 10
-    from merlin.videoportal_videopage as outerpage
+    from %s.videoportal_videopage as outerpage
     where outerpage.id not in
         (select ((page.id))
-            from merlin.videoportal_videopage as page
+            from %s.videoportal_videopage as page
 
-            inner join merlin.videoingester_videoasset as asset
+            inner join %s.videoingester_videoasset as asset
                 on page.video_asset_id = asset.id
 
-            inner join merlin.videoingester_videoassetimagefile as vaif
+            inner join %s.videoingester_videoassetimagefile as vaif
                 on asset.id = vaif.video_asset_id
         );
-    """)
+    """, (DATABASE, DATABASE, DATABASE, DATABASE,))
 
     res = con.store_result()
     vpage_imgs_map = get_obj_imgs_map(res)
     updatable_vpages = create_usable_imgs_map(vpage_imgs_map)
-    update_vpage_image(cursor, updatable_vpages)
+    update_vpage_image(con, cursor, updatable_vpages)
 
 
 @log_entry
 def migrate_vpage_its_imgs(con, cursor):
     con.query("""
         SELECT page.id, vaif.ingested_url, vaif.profile_id
-        FROM merlin.videoportal_videopage AS page
+        FROM %s.videoportal_videopage AS page
 
-        INNER JOIN merlin.videoingester_videoasset AS asset
+        INNER JOIN %s.videoingester_videoasset AS asset
             ON page.video_asset_id = asset.id
 
-        INNER JOIN merlin.videoingester_videoassetimagefile AS vaif
+        INNER JOIN %s.videoingester_videoassetimagefile AS vaif
             ON asset.id = vaif.video_asset_id
 
         WHERE ( vaif.ingested_url LIKE 'http://image.pbs.org%'
                     OR vaif.ingested_url LIKE 'http://image-staging.pbs.org%' )
         ;
-    """)
+    """, (DATABASE, DATABASE, DATABASE))
     res = con.store_result()
 
     vpage_imgs_map = get_obj_imgs_map(res)
     updatable_vpages = create_usable_imgs_map(vpage_imgs_map)
-    update_vpage_image(cursor, updatable_vpages)
+    update_vpage_image(con, cursor, updatable_vpages)
+
+
+def get_last_traceback_str():
+    sys_last_traceback = getattr(sys, 'last_traceback', '')
+    if sys_last_traceback:
+        return str(traceback.format_tb(sys_last_traceback))
+    else:
+        return ''
 
 
 @log_entry
@@ -485,27 +561,26 @@ def erase_wo_img_4_invalid_asset(con, cursor):
         For all these WebObjects, clear their `image` field.
     """
     con.query("""
-        select
-            wo.id, '', 10
-            from merlin.core_webobject as wo
-            inner join merlin.core_video as video
-                on wo.id = video.webobject_ptr_id
-            left join merlin.videoingester_videoasset as vasset
-                on video.videoasset_guid = vasset.guid
-            where wo.image <> ''
-            and wo.image not like 'http://image-staging.pbs.org%'
-            and wo.image not like 'http://image.pbs.org%'
-            and vasset.id is NULL
+        SELECT wo.id, '', 10
+            FROM %s.core_webobject AS wo
+            INNER JOIN %s.core_video AS video
+                ON wo.id = video.webobject_ptr_id
+            LEFT JOIN %s.videoingester_videoasset AS vasset
+                ON video.videoasset_guid = vasset.guid
+            WHERE wo.image <> ''
+            AND wo.image NOT LIKE 'http://image-staging.pbs.org%'
+            AND wo.image NOT LIKE 'http://image.pbs.org%'
+            AND vasset.id IS NULL
             ;
-    """)
+    """, (DATABASE, DATABASE, DATABASE,))
     res = con.store_result()
     wo_imgs_map = get_obj_imgs_map(res)
     updatable_wos = create_usable_imgs_map(wo_imgs_map)
-    update_wo_image(cursor, updatable_wos)
+    update_wo_image(con, cursor, updatable_wos)
 
 
 if __name__ == '__main__':
-    con = mkcon()  # TODO!!!! do this better, rofl!
+    con = mkcon()
     cursor = con.cursor()
 
     try:
@@ -527,12 +602,15 @@ if __name__ == '__main__':
 
     except Exception, e:
         # con.rollback()
-        logger.warning('Errors were not caught at the topmost level')
-        logger.warning(str(e))
-        pass
+        # sys.
+        # sys_last_traceback = getattr(sys, 'last_traceback', '')
+        # tb_str = str(traceback.format_tb(sys_last_traceback))
+        logger.error('Errors were not caught at the topmost level')
+        logger.error(str(e))
+        logger.error('Traceback:' % get_last_traceback_str())
     else:
         # con.commit()
         pass
 
-    con.commit()
+    # con.commit()
     con.close()
