@@ -55,7 +55,7 @@ if __name__ == '__main__':
 def log_entry(func):
     @functools.wraps(func)
     def wrapper(*args, **kwargs):
-        logger.info("Entered %s" % func.func_name)
+        logger.debug("Entered %s" % func.func_name)
         return func(*args, **kwargs)
 
     return wrapper
@@ -243,8 +243,6 @@ def upload_img_to_its(img_url, its_endpoint, namespace, its_cons_key,
         try:
             image = fetch_file(img_url, 20)
         except IOError, err:
-            # sys_last_traceback = getattr(sys, 'last_traceback', '')
-            # tb_str = str(sys_last_traceback.format_tb(sys_last_traceback))
             msg = 'File too big. \nTaceback: %s' % get_last_traceback_str()
             raise UploadException(message=msg, previous=err)
 
@@ -261,12 +259,9 @@ def upload_img_to_its(img_url, its_endpoint, namespace, its_cons_key,
         if resp.status_code == 201:
             try:
                 ingested_url = json.loads(resp.text)['public_url']
-                logger.info("The obtained URL: %s" % ingested_url)
+                logger.debug("The obtained URL: %s" % ingested_url)
                 return ingested_url
             except (TypeError, AttributeError), err:
-                # sys_last_traceback = getattr(sys, 'last_traceback', '')
-                # tb_str = str(sys_last_traceback.format_tb(
-                # sys_last_traceback))
                 message = ('Invalid response type: \n %s' % resp.text +
                            '\nTraceback: %s ' % get_last_traceback_str()
                 )
@@ -274,9 +269,6 @@ def upload_img_to_its(img_url, its_endpoint, namespace, its_cons_key,
                     message=(message),
                     previous=err)
             except KeyError, err:
-                # sys_last_traceback = getattr(sys, 'last_traceback', '')
-                # tb_str = str(sys_last_traceback.format_tb(
-                # sys_last_traceback))
                 message = ('The public url was not returned' +
                            '\nTraceback %s' % get_last_traceback_str())
                 raise UploadException(message=message
@@ -287,66 +279,12 @@ def upload_img_to_its(img_url, its_endpoint, namespace, its_cons_key,
         raise UploadException(
             message=(err.message + ' Previous msg:' + prev_msg))
     except Exception, err:
-        # sys_last_traceback = getattr(sys, 'last_traceback', '')
-        # tb_str = str(sys_last_traceback.format_tb(sys_last_traceback))
         message = ('Unhandled exception while uploading' +
                    '\nTraceback: %s' % get_last_traceback_str())
         raise UploadException(message=message, previous=err)
 
 
-def deprecated_upload_img_to_its(img_url, its_endpoint, its_cons_key,
-                                 its_cons_secret):
-    """Uploads the specified image, from the given url into ITS, and returns
-    the link for that image
-
-    :param its_cons_secret: its consumer secret key (from the settings module)
-    :param its_cons_key: the consumer key (from the settings module)
-    :param its_endpoint: the ITS endpoint (from the settings file)
-    :param img_url: the source url of the image
-    :return The URL of the image, posted in ITS
-    """
-    oauth_consumer = oauth.Consumer(key=its_cons_key,
-                                    secret=its_cons_secret)
-
-    try:
-        image_stream = urllib2.urlopen(img_url)
-    except (urllib2.HTTPError, AttributeError), e:
-        raise UploadException(previous=e)
-
-    request = build_request(its_endpoint, oauth_consumer, METHOD_POST)
-
-    conn = httplib2.Http()
-    headers = {'Content-Type': 'image/png'}
-
-    image = image_stream.read()
-    request_url = request.to_url()
-
-    try:
-        # logger.debug(image)
-        logger.debug("investigate the 'image' name")
-        resp, content = conn.request(
-            request_url,
-            METHOD_POST,
-            body=image,
-            headers=headers)
-        logger.warning('ping')
-
-    except Exception as e:
-        logger.warning("Connection problem")
-        logger.warning("Original image URL: %s" % img_url)
-        logger.warning("Type of img_url var: %s" % type(img_url))
-        logger.warning("Error type %s" % type(e))
-        logging.exception("exception occured")
-        raise e
-
-    if resp['status'] == 201:
-        json_content = json.loads(content)
-        return json_content['public_url']
-    else:
-        raise UploadException(message='Uploading failed for %s' % img_url)
-
-
-def migrate_from_result(con, cursor, res, update_func, namespace):
+def migrate_from_result(con, cursor, res, update_func, namespace, obj_type):
     """Given the result set, the cursor and the specific update function,
         updates the given object with the specific img_url
     """
@@ -358,7 +296,7 @@ def migrate_from_result(con, cursor, res, update_func, namespace):
 
     for counter, item in enumerate(updatable_objs.items()):
         obj_id, img_url = item
-        logger.info("Processing %s out of " % counter + str(objs_count))
+        logger.debug("Processing %s out of " % counter + str(objs_count))
         try:
             if img_url:
                 logger.debug("Object id: %s, img_url: %s" % (obj_id, img_url))
@@ -371,15 +309,13 @@ def migrate_from_result(con, cursor, res, update_func, namespace):
             else:
                 updated_objs[obj_id] = ''
         except UploadException, e:
-            #TODO - log failure to upload image (Obj type: Obj id)
-            logger.info("")
+            logger.info(
+                "ERROR: %s: %s - %s" % (obj_type, str(obj_id), str(e.message)))
             errors[obj_id] = {'img_url': img_url, 'error': e.message}
 
     update_func(con, cursor, updated_objs)
 
     if errors:
-        logger.info("Errors: ")
-        logger.info(errors)
         raise UploadException(errors=errors)
 
 
@@ -407,14 +343,12 @@ def migrate_video_non_its_images(con, cursor):
     res = con.store_result()
 
     try:
-        migrate_from_result(con, cursor, res, update_wo_image, VIDEO_ASSETS_NS)
+        migrate_from_result(con, cursor, res, update_wo_image, VIDEO_ASSETS_NS,
+                            'WEBOBJECT')
     except UploadException, ex:
-        logger.warning("The following WebObjects had errors:")
-        logger.warning(ex.errors)
-
-
-def migrate_non_vid_its_images():
-    pass
+        # logger.warning("The following WebObjects had errors:")
+        # logger.warning(ex.errors)
+        pass
 
 
 @log_entry
@@ -439,10 +373,12 @@ def migrate_non_vid_non_its(con, cursor):
 
     res = con.store_result()
     try:
-        migrate_from_result(con, cursor, res, update_wo_image, WEBOBJECTS_NS)
+        migrate_from_result(con, cursor, res, update_wo_image, WEBOBJECTS_NS,
+                            'WEBOBJECT')
     except UploadException, ex:
-        logger.warning("The following WebObjects had errors:")
-        logger.warning(ex.errors)
+        pass
+        # logger.warning("The following WebObjects had errors:")
+        # logger.warning(ex.errors)
 
 
 @log_entry
@@ -471,20 +407,11 @@ def migrate_vpage_non_its_imgs(con, cursor):
 
     try:
         migrate_from_result(con, cursor, res, update_vpage_image,
-                            VIDEO_ASSETS_NS)
+                            VIDEO_ASSETS_NS, "VIDEOPAGE")
     except UploadException, ex:
-        logger.warning("The following VideoPages had errors:")
-        logger.warning(ex.errors)
-
-
-@log_entry
-def copy_non_vid_its(con, cursor):
-    """
-    For the WeObjects (webobject_type = 'WebObject') with ITS images,
-        don't do anything
-    """
-
-    pass
+        # logger.warning("The following VideoPages had errors:")
+        # logger.warning(ex.errors)
+        pass
 
 
 class UploadException(Exception):
@@ -572,7 +499,7 @@ def erase_wo_img_4_invalid_asset(con, cursor):
             AND wo.image NOT LIKE 'http://image.pbs.org%'
             AND vasset.id IS NULL
             ;
-    """, (DATABASE, DATABASE, DATABASE,))
+    """, (DATABASE, DATABASE, DATABASE))
     res = con.store_result()
     wo_imgs_map = get_obj_imgs_map(res)
     updatable_wos = create_usable_imgs_map(wo_imgs_map)
@@ -592,8 +519,6 @@ if __name__ == '__main__':
 
         erase_wo_img_4_invalid_asset(con, cursor)
 
-        copy_non_vid_its(con, cursor)
-
         migrate_vpage_its_imgs(con, cursor)
 
         migrate_vpage_non_its_imgs(con, cursor)
@@ -601,16 +526,8 @@ if __name__ == '__main__':
         erase_unavailable_vp_imgs(con, cursor)
 
     except Exception, e:
-        # con.rollback()
-        # sys.
-        # sys_last_traceback = getattr(sys, 'last_traceback', '')
-        # tb_str = str(traceback.format_tb(sys_last_traceback))
         logger.error('Errors were not caught at the topmost level')
         logger.error(str(e))
         logger.error('Traceback:' % get_last_traceback_str())
-    else:
-        # con.commit()
-        pass
 
-    # con.commit()
     con.close()
